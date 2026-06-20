@@ -1,0 +1,24 @@
+# We cross-compile to bare-metal ("none") targets so nothing links libc.
+# rust-lld (bundled with rustup) emits a static Linux ELF; we supply our own
+# _start, so the kernel execs us directly with no dynamic interpreter.
+#
+# relocation-model=static keeps the binary position-dependent (ET_EXEC) so that
+# there are no load-time relocations to resolve -- there is no libc startup code
+# to resolve them for us.
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=--no-pie",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=--no-pie",
+]
+
+[alias]
+# convenience: `cargo amd64` / `cargo arm64`
+amd64 = "build --target x86_64-unknown-none"
+arm64 = "build --target aarch64-unknown-none"

@@ -1,0 +1,30 @@
+[package]
+name = "zrc"
+version = "0.0.1"
+edition = "2021"
+description = "A libc-free, zero-dependency OCI container runtime (runc alternative) in Rust"
+
+[[bin]]
+name = "zrc"
+path = "src/main.rs"
+
+# No dependencies. By design.
+[dependencies]
+
+[features]
+default = []
+# Sysbox-style system-container support (emulated /proc & /sys, seccomp-notify
+# syscall interception, auto user-namespacing). Off by default: the emulation
+# code is excluded from the build entirely, and even when compiled in it stays
+# dormant unless a container opts in via the `org.zrc.sysbox` annotation.
+sysbox = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
