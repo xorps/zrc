@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "xorpio"
+version = "0.0.0"
+
+[[package]]
 name = "zrc"
 version = "0.0.1"
+dependencies = [
+ "xorpio",
+]

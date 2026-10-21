@@ -1,69 +1,54 @@
-//! Sysbox-style system-container support (compiled in only with
-//! `--features sysbox`, and active per-container only when the
-//! `org.zrc.sysbox` annotation opts in — see `Spec::sysbox_requested`).
+//! Sysbox-style system containers (built with `--features sysbox`, and used
+//! only by containers with the `org.zrc.sysbox=true` annotation).
 //!
-//! The goal is to run system-level workloads (systemd, Docker, Kubernetes)
-//! *inside* an unprivileged container. That rests on three pillars; this module
-//! is where each lands:
-//!   1. auto user-namespacing (DONE here — apply the userns + maps if absent),
-//!   2. emulated `/proc` & `/sys` so inner daemons see coherent kernel state
-//!      (PENDING — FUSE-backed),
-//!   3. seccomp-notify interception of `mount`, `setns`, … to emulate them
-//!      safely (PENDING — listener loop + per-syscall handlers).
+//! A system container runs system software (systemd, Docker) as an
+//! unprivileged user on the host. zrc provides the namespace part: its own
+//! user namespace, mapping container root to an unprivileged host range,
+//! and its own cgroup namespace.
+//!
+//! The rest of Sysbox needs a long-lived agent next to the container, which
+//! a one-shot runtime cannot be: emulated `/proc` and `/sys` (Sysbox serves
+//! them over FUSE) and seccomp-notify interception of `mount` and friends.
+//! Until ID-mapped mounts are wired in, the rootfs must be owned by the
+//! mapped host range.
 
-use crate::oci::{IdMap, Namespace, Spec};
+use xorpio::ns;
 
-/// Default host base for the auto user-namespace mapping when the bundle didn't
-/// specify one. Mirrors the common Sysbox/`subuid` convention.
-const DEFAULT_HOST_BASE: u32 = 100_000;
-const DEFAULT_RANGE: u32 = 65_536;
+use crate::oci::{IdMap, Spec, SpecError};
 
-/// Apply Sysbox defaults to a parsed spec, in place, before the container is
-/// created. Only the pieces we can do safely today are applied; the emulation
-/// pillars are wired here as they land.
-pub fn prepare(spec: &mut Spec) {
-    eprintln!("zrc: sysbox mode enabled for this container");
+/// The host range container ids map to without explicit mappings, by the
+/// common `/etc/subuid` convention.
+const HOST_BASE: u32 = 100_000;
+const RANGE: u32 = 65_536;
 
-    // Pillar 1 — a system container always gets its own user namespace so that
-    // in-container root is unprivileged on the host.
-    if !spec.has_user_ns() {
-        spec.namespaces.push(Namespace {
-            typ: "user".into(),
-            path: None,
-        });
+/// Adds what a system container needs and the spec did not ask for.
+pub fn prepare(spec: &mut Spec) -> Result<(), SpecError> {
+    let default = IdMap {
+        container: 0,
+        host: HOST_BASE,
+        size: RANGE,
+    };
+    if !spec.namespaces.has(ns::NEWUSER) {
+        spec.namespaces.new |= ns::NEWUSER;
+        if spec.uid_maps.is_empty() {
+            spec.uid_maps
+                .push(default)
+                .map_err(|_full| SpecError::TooMany {
+                    field: "linux.uidMappings",
+                    max: crate::oci::MAX_ID_MAPS,
+                })?;
+        }
+        if spec.gid_maps.is_empty() {
+            spec.gid_maps
+                .push(default)
+                .map_err(|_full| SpecError::TooMany {
+                    field: "linux.gidMappings",
+                    max: crate::oci::MAX_ID_MAPS,
+                })?;
+        }
     }
-    if spec.uid_mappings.is_empty() {
-        spec.uid_mappings.push(IdMap {
-            container_id: 0,
-            host_id: DEFAULT_HOST_BASE,
-            size: DEFAULT_RANGE,
-        });
+    if !spec.namespaces.has(ns::NEWCGROUP) {
+        spec.namespaces.new |= ns::NEWCGROUP;
     }
-    if spec.gid_mappings.is_empty() {
-        spec.gid_mappings.push(IdMap {
-            container_id: 0,
-            host_id: DEFAULT_HOST_BASE,
-            size: DEFAULT_RANGE,
-        });
-    }
-
-    // A dedicated cgroup namespace, so inner cgroup-aware daemons see a clean root.
-    if !spec.has_cgroup_ns() {
-        spec.namespaces.push(Namespace {
-            typ: "cgroup".into(),
-            path: None,
-        });
-    }
-
-    // Until ID-mapped mounts land, the rootfs must be owned by the mapped host
-    // range; flag that rather than failing obscurely at exec.
-    eprintln!(
-        "zrc: sysbox: rootfs must be owned by host uid/gid {}..{} \
-         (ID-mapped mounts not yet implemented)",
-        DEFAULT_HOST_BASE,
-        DEFAULT_HOST_BASE + DEFAULT_RANGE
-    );
-
-    // Pillar 2 & 3 (emulated /proc & /sys, seccomp-notify interception) attach
-    // here next.
+    Ok(())
 }
