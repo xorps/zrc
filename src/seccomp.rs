@@ -1,281 +1,439 @@
-//! seccomp-bpf syscall filtering.
+//! Compiles `linux.seccomp` into a classic BPF program while it is parsed.
 //!
-//! We assemble a classic-BPF program from the OCI `linux.seccomp` section and
-//! install it with `seccomp(SECCOMP_SET_MODE_FILTER)`. Filtering is at the
-//! syscall-name level (per-argument rules in the spec are not yet applied).
-//! `SCMP_ACT_NOTIFY` is treated as ALLOW for now — real user-notification is the
-//! Sysbox-interception milestone.
+//! Layout of the program:
+//!
+//! ```text
+//!   load arch; foreign architecture -> kill process
+//!   load nr;   x32 syscall (x86_64, but not -1) -> kill process
+//!   rules, first match wins:
+//!     no args:   jeq nr1 -> ret | jeq nr2 -> ret | ... ; ja +1 ; ret ACTION
+//!     with args: jeq nr else next; <arg checks, any false -> next>; ret ACTION; next: load nr
+//!   ret DEFAULT
+//! ```
+//!
+//! Syscall names this architecture lacks are left out of the program, as
+//! libseccomp does: profiles list syscalls of every architecture. Only the
+//! native architecture is allowed; others (including x86 and x32 on x86_64)
+//! are killed.
 
-use alloc::vec::Vec;
+use xorpio::Errno;
+use xorpio::seccomp::{self as sc, SockFilter, bpf, data, ret};
+use xorpio::sys::nr;
 
-use crate::oci::Seccomp;
-use crate::sys;
+use crate::fixed::Fixed;
+use crate::io::{Msg, Report};
+use crate::json::Parser;
+use crate::oci::{SpecError, Str};
 
-// ---- BPF encoding ----
-const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
-const BPF_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
-const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
-
-// seccomp_data field offsets.
-const OFF_NR: u32 = 0;
-const OFF_ARCH: u32 = 4;
-
-// SECCOMP_RET_* action words.
-const RET_KILL_PROCESS: u32 = 0x8000_0000;
-const RET_KILL_THREAD: u32 = 0x0000_0000;
-const RET_TRAP: u32 = 0x0003_0000;
-const RET_ERRNO: u32 = 0x0005_0000;
-const RET_TRACE: u32 = 0x7ff0_0000;
-const RET_LOG: u32 = 0x7ffc_0000;
-const RET_ALLOW: u32 = 0x7fff_0000;
-const RET_USER_NOTIF: u32 = 0x7fc0_0000;
-
-// SCMP_ACT_NOTIFY only becomes a real user-notification when the sysbox feature
-// is built; otherwise it degrades to ALLOW so a notify-using profile still runs.
-#[cfg(feature = "sysbox")]
-const NOTIFY_RET: u32 = RET_USER_NOTIF;
-#[cfg(not(feature = "sysbox"))]
-const NOTIFY_RET: u32 = RET_ALLOW;
-
-#[cfg(target_arch = "x86_64")]
-const NATIVE_AUDIT_ARCH: u32 = 0xC000_003E;
-#[cfg(target_arch = "aarch64")]
-const NATIVE_AUDIT_ARCH: u32 = 0xC000_00B7;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SockFilter {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
+pub struct Program {
+    pub insns: Fixed<SockFilter, { sc::MAX_INSNS }>,
+    /// `SECCOMP_FILTER_FLAG_*`.
+    pub flags: u32,
 }
 
-#[repr(C)]
-struct SockFprog {
-    len: u16,
-    filter: *const SockFilter,
-}
-
-fn stmt(code: u16, k: u32) -> SockFilter {
-    SockFilter { code, jt: 0, jf: 0, k }
-}
-fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
-    SockFilter { code, jt, jf, k }
-}
-
-fn action_ret(action: &str, errno: u16) -> u32 {
-    match action {
-        "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" => RET_KILL_THREAD,
-        "SCMP_ACT_KILL_PROCESS" => RET_KILL_PROCESS,
-        "SCMP_ACT_TRAP" => RET_TRAP,
-        "SCMP_ACT_ERRNO" => RET_ERRNO | (errno as u32 & 0xffff),
-        "SCMP_ACT_TRACE" => RET_TRACE | (errno as u32 & 0xffff),
-        "SCMP_ACT_LOG" => RET_LOG,
-        "SCMP_ACT_ALLOW" => RET_ALLOW,
-        "SCMP_ACT_NOTIFY" => NOTIFY_RET,
-        _ => RET_ERRNO | 1, // unknown → EPERM, fail safe
+impl Program {
+    pub const fn new() -> Self {
+        Self {
+            insns: Fixed::new(),
+            flags: 0,
+        }
     }
 }
 
-fn has_notify(sc: &Seccomp) -> bool {
-    NOTIFY_RET == RET_USER_NOTIF
-        && (sc.default_action == "SCMP_ACT_NOTIFY"
-            || sc.rules.iter().any(|r| r.action == "SCMP_ACT_NOTIFY"))
+#[derive(Clone, Copy, Debug)]
+pub enum CompileError {
+    UnknownAction(Str),
+    UnknownOperator(Str),
+    UnknownFlag(Str),
+    /// An argument index outside 0..6.
+    ArgIndex(u32),
+    /// An errno outside the 16 bits seccomp returns.
+    Errno(u32),
+    /// More than `BPF_MAXINSNS` instructions.
+    TooLarge,
+    TooManyNames,
+    TooManyArgs,
+    /// `SCMP_ACT_NOTIFY` and `listenerPath`: no notification agent support.
+    Notify,
+    /// Docker profile `includes`/`excludes`, which only Docker resolves.
+    Conditional,
 }
 
-/// Build the filter program. Each matched syscall jumps to an inline RET, so
-/// jump offsets stay tiny regardless of how many syscalls are listed.
-fn build(sc: &Seccomp) -> (Vec<SockFilter>, usize) {
-    let mut p = Vec::new();
-    let mut unknown = 0usize;
+impl Report for CompileError {
+    fn report<const N: usize>(&self, m: &mut Msg<N>) {
+        match *self {
+            Self::UnknownAction(a) => m.str("unknown action '").cstr(a).str("'"),
+            Self::UnknownOperator(o) => m.str("unknown operator '").cstr(o).str("'"),
+            Self::UnknownFlag(f) => m.str("unknown flag '").cstr(f).str("'"),
+            Self::ArgIndex(i) => m.str("argument index ").u64(i as u64).str(" out of range"),
+            Self::Errno(e) => m.str("errnoRet ").u64(e as u64).str(" out of range"),
+            Self::TooLarge => m.str("program exceeds 4096 instructions"),
+            Self::TooManyNames => m.str("too many names in one rule"),
+            Self::TooManyArgs => m.str("too many args in one rule"),
+            Self::Notify => m.str("SCMP_ACT_NOTIFY and listenerPath are not supported"),
+            Self::Conditional => m.str("rule includes/excludes are not supported"),
+        };
+    }
+}
 
-    // Reject foreign architectures outright (classic seccomp hardening).
-    p.push(stmt(BPF_LD_W_ABS, OFF_ARCH));
-    p.push(jump(BPF_JEQ_K, NATIVE_AUDIT_ARCH, 1, 0)); // match → skip the kill
-    p.push(stmt(BPF_RET_K, RET_KILL_PROCESS));
+type Result<T> = core::result::Result<T, SpecError>;
 
-    // Load the syscall number for the comparisons below.
-    p.push(stmt(BPF_LD_W_ABS, OFF_NR));
+const EPERM: u32 = Errno::EPERM.raw() as u32;
+const MAX_RULE_NAMES: usize = 1024;
+const MAX_RULE_ARGS: usize = 8;
+/// x32 syscalls on x86_64 carry this bit in their number.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-    for rule in &sc.rules {
-        let ret = action_ret(&rule.action, rule.errno);
-        for name in &rule.names {
-            match syscall_nr(name) {
-                Some(nr) => {
-                    // if A == nr: fall to the RET (jt=0); else skip it (jf=1)
-                    p.push(jump(BPF_JEQ_K, nr, 0, 1));
-                    p.push(stmt(BPF_RET_K, ret));
+#[derive(Clone, Copy)]
+enum Op {
+    Ne,
+    Lt,
+    Le,
+    Eq,
+    Ge,
+    Gt,
+    MaskedEq,
+}
+
+#[derive(Clone, Copy)]
+struct Arg {
+    index: u32,
+    value: u64,
+    value_two: u64,
+    op: Op,
+}
+
+struct Rule {
+    names: Fixed<Str, MAX_RULE_NAMES>,
+    action: Option<Str>,
+    errno: Option<u32>,
+    args: Fixed<Arg, MAX_RULE_ARGS>,
+}
+
+fn emit(prog: &mut Program, insn: SockFilter) -> Result<usize> {
+    let at = prog.insns.len();
+    prog.insns
+        .push(insn)
+        .map_err(|_full| SpecError::Seccomp(CompileError::TooLarge))?;
+    Ok(at)
+}
+
+fn action(name: Str, errno: Option<u32>) -> Result<u32> {
+    let errno = errno.unwrap_or(EPERM);
+    let data = || {
+        if errno > 0xffff {
+            return Err(SpecError::Seccomp(CompileError::Errno(errno)));
+        }
+        Ok(errno)
+    };
+    Ok(match name.to_bytes() {
+        b"SCMP_ACT_KILL" | b"SCMP_ACT_KILL_THREAD" => ret::KILL_THREAD,
+        b"SCMP_ACT_KILL_PROCESS" => ret::KILL_PROCESS,
+        b"SCMP_ACT_TRAP" => ret::TRAP,
+        b"SCMP_ACT_ERRNO" => ret::ERRNO | data()?,
+        b"SCMP_ACT_TRACE" => ret::TRACE | data()?,
+        b"SCMP_ACT_LOG" => ret::LOG,
+        b"SCMP_ACT_ALLOW" => ret::ALLOW,
+        b"SCMP_ACT_NOTIFY" => return Err(SpecError::Seccomp(CompileError::Notify)),
+        _ => return Err(SpecError::Seccomp(CompileError::UnknownAction(name))),
+    })
+}
+
+/// Compiles the `linux.seccomp` object at `p` into `prog`, which must be empty.
+pub fn compile(p: &mut Parser<'static>, prog: &mut Program) -> Result<()> {
+    emit(prog, SockFilter::stmt(bpf::LD_W_ABS, data::ARCH))?;
+    emit(prog, SockFilter::jump(bpf::JMP_JEQ_K, sc::AUDIT_ARCH, 1, 0))?;
+    emit(prog, SockFilter::stmt(bpf::RET_K, ret::KILL_PROCESS))?;
+    emit(prog, SockFilter::stmt(bpf::LD_W_ABS, data::NR))?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // -1 is a syscall a tracer chose to skip, not an x32 one.
+        emit(prog, SockFilter::jump(bpf::JMP_JEQ_K, u32::MAX, 2, 0))?;
+        emit(
+            prog,
+            SockFilter::jump(bpf::JMP_JGE_K, X32_SYSCALL_BIT, 0, 1),
+        )?;
+        emit(prog, SockFilter::stmt(bpf::RET_K, ret::KILL_PROCESS))?;
+    }
+
+    let mut default_action = None;
+    let mut default_errno = None;
+    let mut o = p.object()?;
+    while let Some(key) = o.next(p)? {
+        match key.to_bytes() {
+            b"defaultAction" => default_action = Some(p.str()?),
+            b"defaultErrnoRet" => default_errno = Some(p.u32()?),
+            b"flags" => {
+                let mut a = p.array()?;
+                while a.next(p)? {
+                    let f = p.str()?;
+                    prog.flags |= match f.to_bytes() {
+                        b"SECCOMP_FILTER_FLAG_TSYNC" => sc::flag::TSYNC,
+                        b"SECCOMP_FILTER_FLAG_LOG" => sc::flag::LOG,
+                        b"SECCOMP_FILTER_FLAG_SPEC_ALLOW" => sc::flag::SPEC_ALLOW,
+                        b"SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV" => sc::flag::WAIT_KILLABLE_RECV,
+                        _ => return Err(SpecError::Seccomp(CompileError::UnknownFlag(f))),
+                    };
                 }
-                None => unknown += 1,
+            }
+            b"listenerPath" => {
+                if !p.str()?.is_empty() {
+                    return Err(SpecError::Seccomp(CompileError::Notify));
+                }
+            }
+            b"syscalls" => {
+                let mut a = p.array()?;
+                while a.next(p)? {
+                    let mut rule = Rule {
+                        names: Fixed::new(),
+                        action: None,
+                        errno: None,
+                        args: Fixed::new(),
+                    };
+                    parse_rule(p, &mut rule)?;
+                    emit_rule(prog, &rule)?;
+                }
+            }
+            // `architectures`: only the native one is ever allowed.
+            _ => p.skip()?,
+        }
+    }
+    let default = default_action.ok_or(SpecError::Missing("linux.seccomp.defaultAction"))?;
+    emit(
+        prog,
+        SockFilter::stmt(bpf::RET_K, action(default, default_errno)?),
+    )?;
+    Ok(())
+}
+
+fn parse_rule(p: &mut Parser<'static>, rule: &mut Rule) -> Result<()> {
+    let mut o = p.object()?;
+    while let Some(key) = o.next(p)? {
+        match key.to_bytes() {
+            b"names" => {
+                let mut a = p.array()?;
+                while a.next(p)? {
+                    let name = p.str()?;
+                    rule.names
+                        .push(name)
+                        .map_err(|_full| SpecError::Seccomp(CompileError::TooManyNames))?;
+                }
+            }
+            b"action" => rule.action = Some(p.str()?),
+            b"errnoRet" => rule.errno = Some(p.u32()?),
+            b"args" => {
+                let mut a = p.array()?;
+                while a.next(p)? {
+                    let arg = parse_arg(p)?;
+                    rule.args
+                        .push(arg)
+                        .map_err(|_full| SpecError::Seccomp(CompileError::TooManyArgs))?;
+                }
+            }
+            b"includes" | b"excludes" => {
+                let mut c = p.object()?;
+                if c.next(p)?.is_some() {
+                    return Err(SpecError::Seccomp(CompileError::Conditional));
+                }
+            }
+            _ => p.skip()?,
+        }
+    }
+    Ok(())
+}
+
+fn parse_arg(p: &mut Parser<'static>) -> Result<Arg> {
+    let mut arg = Arg {
+        index: 0,
+        value: 0,
+        value_two: 0,
+        op: Op::Eq,
+    };
+    let mut op = None;
+    let mut o = p.object()?;
+    while let Some(key) = o.next(p)? {
+        match key.to_bytes() {
+            b"index" => {
+                arg.index = p.u32()?;
+                if arg.index > 5 {
+                    return Err(SpecError::Seccomp(CompileError::ArgIndex(arg.index)));
+                }
+            }
+            b"value" => arg.value = p.u64()?,
+            b"valueTwo" => arg.value_two = p.u64()?,
+            b"op" => {
+                let name = p.str()?;
+                op = Some(match name.to_bytes() {
+                    b"SCMP_CMP_NE" => Op::Ne,
+                    b"SCMP_CMP_LT" => Op::Lt,
+                    b"SCMP_CMP_LE" => Op::Le,
+                    b"SCMP_CMP_EQ" => Op::Eq,
+                    b"SCMP_CMP_GE" => Op::Ge,
+                    b"SCMP_CMP_GT" => Op::Gt,
+                    b"SCMP_CMP_MASKED_EQ" => Op::MaskedEq,
+                    _ => return Err(SpecError::Seccomp(CompileError::UnknownOperator(name))),
+                });
+            }
+            _ => p.skip()?,
+        }
+    }
+    arg.op = op.ok_or(SpecError::Missing("linux.seccomp.syscalls[].args[].op"))?;
+    Ok(arg)
+}
+
+fn emit_rule(prog: &mut Program, rule: &Rule) -> Result<()> {
+    let action = action(
+        rule.action
+            .ok_or(SpecError::Missing("linux.seccomp.syscalls[].action"))?,
+        rule.errno,
+    )?;
+    let numbers = rule
+        .names
+        .iter()
+        .filter_map(|name| nr::by_name(name.to_bytes()))
+        // Syscall numbers are below 1024 on every architecture.
+        .map(|n| n as u32);
+
+    if rule.args.is_empty() {
+        // Up to 255 compares jump to one shared return.
+        let mut chunk = Fixed::<u32, 255>::new();
+        for n in numbers {
+            if chunk.push(n).is_err() {
+                emit_chunk(prog, chunk.as_slice(), action)?;
+                chunk = Fixed::new();
+                chunk
+                    .push(n)
+                    .map_err(|_full| SpecError::Seccomp(CompileError::TooManyNames))?;
+            }
+        }
+        if !chunk.is_empty() {
+            emit_chunk(prog, chunk.as_slice(), action)?;
+        }
+        return Ok(());
+    }
+
+    for n in numbers {
+        let mut fails = Fixed::<(usize, bool), { MAX_RULE_ARGS * 3 + 1 }>::new();
+        let mut fail = |prog: &mut Program, insn: SockFilter, on_true: bool| -> Result<()> {
+            let at = emit(prog, insn)?;
+            fails
+                .push((at, on_true))
+                .map_err(|_full| SpecError::Seccomp(CompileError::TooManyArgs))
+        };
+        fail(prog, SockFilter::jump(bpf::JMP_JEQ_K, n, 0, 0), false)?;
+        for arg in &rule.args {
+            emit_arg(prog, arg, &mut fail)?;
+        }
+        emit(prog, SockFilter::stmt(bpf::RET_K, action))?;
+        let next = emit(prog, SockFilter::stmt(bpf::LD_W_ABS, data::NR))?;
+        for &(at, on_true) in fails.iter() {
+            let offset = u8::try_from(next - at - 1)
+                .map_err(|_too_far| SpecError::Seccomp(CompileError::TooLarge))?;
+            if let Some(insn) = prog.insns.as_mut_slice().get_mut(at) {
+                if on_true {
+                    insn.jt = offset;
+                } else {
+                    insn.jf = offset;
+                }
             }
         }
     }
-
-    p.push(stmt(BPF_RET_K, action_ret(&sc.default_action, sc.default_errno)));
-    (p, unknown)
+    Ok(())
 }
 
-/// Assemble and install the filter. Sets NO_NEW_PRIVS (required unless we hold
-/// CAP_SYS_ADMIN). Call this last — after any syscalls the runtime itself needs.
-///
-/// Returns the user-notification fd (`>= 0`) when the profile uses
-/// `SCMP_ACT_NOTIFY` and this is a sysbox build; otherwise `-1`. The caller is
-/// responsible for handing a returned fd to a supervisor (see `supervise`).
-pub fn install(sc: &Seccomp) -> Result<i32, &'static str> {
-    let (prog, unknown) = build(sc);
-    if unknown > 0 {
-        eprintln!(
-            "zrc: warning: {} seccomp syscall name(s) unknown to zrc and not filtered",
-            unknown
-        );
+/// `jeq n_i -> ret` for each number, falling through to `ja +1` past the `ret`.
+fn emit_chunk(prog: &mut Program, numbers: &[u32], action: u32) -> Result<()> {
+    let k = numbers.len();
+    for (i, &n) in numbers.iter().enumerate() {
+        // From compare i, the return is at k + 1; jumps count from i + 1.
+        let jt =
+            u8::try_from(k - i).map_err(|_too_far| SpecError::Seccomp(CompileError::TooLarge))?;
+        emit(prog, SockFilter::jump(bpf::JMP_JEQ_K, n, jt, 0))?;
     }
-    if prog.len() > 0xffff {
-        return Err("seccomp program too large");
-    }
-
-    let _ = sys::prctl(sys::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-
-    let notify = has_notify(sc);
-    let flags = if notify {
-        sys::SECCOMP_FILTER_FLAG_NEW_LISTENER
-    } else {
-        0
-    };
-
-    let fprog = SockFprog {
-        len: prog.len() as u16,
-        filter: prog.as_ptr(),
-    };
-    let ret = sys::seccomp(
-        sys::SECCOMP_SET_MODE_FILTER,
-        flags,
-        &fprog as *const SockFprog as usize,
-    )
-    .map_err(|_| "seccomp install")?;
-
-    Ok(if notify { ret as i32 } else { -1 })
+    emit(prog, SockFilter::stmt(bpf::JMP_JA, 1))?;
+    emit(prog, SockFilter::stmt(bpf::RET_K, action))?;
+    Ok(())
 }
 
-/// The seccomp user-notification supervisor loop (sysbox builds only). Runs in
-/// a forked child that inherits `fd`; the kernel blocks each intercepted syscall
-/// until we respond. This is the seam where `mount`, `setns`, etc. get emulated;
-/// for now we acknowledge them with a synthesized success so the in-container
-/// workload makes progress while we report what was intercepted.
-///
-/// Never returns — when the target dies, the pid namespace tears this down too.
-#[cfg(feature = "sysbox")]
-pub fn supervise(fd: usize) -> ! {
-    loop {
-        let mut req = sys::SeccompNotif::default();
-        match sys::ioctl(
-            fd,
-            sys::SECCOMP_IOCTL_NOTIF_RECV,
-            &mut req as *mut sys::SeccompNotif as usize,
-        ) {
-            Ok(_) => {}
-            Err(4) => continue, // EINTR
-            Err(_) => sys::exit_group(0), // listener gone → done
+/// Emits a 64-bit comparison of argument `arg.index` as 32-bit halves. The
+/// condition holding falls through; failing jumps go through `fail`, which
+/// records them for patching to the next rule.
+fn emit_arg(
+    prog: &mut Program,
+    arg: &Arg,
+    fail: &mut impl FnMut(&mut Program, SockFilter, bool) -> Result<()>,
+) -> Result<()> {
+    let hi = |v: u64| (v >> 32) as u32;
+    let lo = |v: u64| v as u32;
+    let ld_hi = SockFilter::stmt(bpf::LD_W_ABS, data::arg_hi(arg.index));
+    let ld_lo = SockFilter::stmt(bpf::LD_W_ABS, data::arg_lo(arg.index));
+    let v = arg.value;
+    match arg.op {
+        Op::Eq => {
+            emit(prog, ld_hi)?;
+            fail(prog, SockFilter::jump(bpf::JMP_JEQ_K, hi(v), 0, 0), false)?;
+            emit(prog, ld_lo)?;
+            fail(prog, SockFilter::jump(bpf::JMP_JEQ_K, lo(v), 0, 0), false)?;
         }
-
-        eprintln!(
-            "zrc: sysbox: intercepted syscall nr={} from pid={} (args: {:#x} {:#x} {:#x})",
-            req.data.nr, req.pid, req.data.args[0], req.data.args[1], req.data.args[3]
-        );
-
-        // Emulation handlers land here. Default: acknowledge with success.
-        let resp = sys::SeccompNotifResp {
-            id: req.id,
-            val: 0,
-            error: 0,
-            flags: 0,
-        };
-        let _ = sys::ioctl(
-            fd,
-            sys::SECCOMP_IOCTL_NOTIF_SEND,
-            &resp as *const sys::SeccompNotifResp as usize,
-        );
+        Op::Ne => {
+            emit(prog, ld_hi)?;
+            // High halves differ: the condition holds, skip the low check.
+            emit(prog, SockFilter::jump(bpf::JMP_JEQ_K, hi(v), 0, 2))?;
+            emit(prog, ld_lo)?;
+            fail(prog, SockFilter::jump(bpf::JMP_JEQ_K, lo(v), 0, 0), true)?;
+        }
+        Op::Gt | Op::Ge => {
+            let cmp = if matches!(arg.op, Op::Gt) {
+                bpf::JMP_JGT_K
+            } else {
+                bpf::JMP_JGE_K
+            };
+            emit(prog, ld_hi)?;
+            // High half greater: holds, skip to the end.
+            emit(prog, SockFilter::jump(bpf::JMP_JGT_K, hi(v), 3, 0))?;
+            fail(prog, SockFilter::jump(bpf::JMP_JEQ_K, hi(v), 0, 0), false)?;
+            emit(prog, ld_lo)?;
+            fail(prog, SockFilter::jump(cmp, lo(v), 0, 0), false)?;
+        }
+        Op::Lt | Op::Le => {
+            // Lt fails when lo >= v, Le when lo > v.
+            let cmp = if matches!(arg.op, Op::Lt) {
+                bpf::JMP_JGE_K
+            } else {
+                bpf::JMP_JGT_K
+            };
+            emit(prog, ld_hi)?;
+            fail(prog, SockFilter::jump(bpf::JMP_JGT_K, hi(v), 0, 0), true)?;
+            // High half smaller: holds, skip the low check.
+            emit(prog, SockFilter::jump(bpf::JMP_JEQ_K, hi(v), 0, 2))?;
+            emit(prog, ld_lo)?;
+            fail(prog, SockFilter::jump(cmp, lo(v), 0, 0), true)?;
+        }
+        Op::MaskedEq => {
+            let mask = v;
+            let want = arg.value_two;
+            emit(prog, ld_hi)?;
+            emit(prog, SockFilter::stmt(bpf::ALU_AND_K, hi(mask)))?;
+            fail(
+                prog,
+                SockFilter::jump(bpf::JMP_JEQ_K, hi(want), 0, 0),
+                false,
+            )?;
+            emit(prog, ld_lo)?;
+            emit(prog, SockFilter::stmt(bpf::ALU_AND_K, lo(mask)))?;
+            fail(
+                prog,
+                SockFilter::jump(bpf::JMP_JEQ_K, lo(want), 0, 0),
+                false,
+            )?;
+        }
     }
+    Ok(())
 }
 
-/// Syscall name → number for the native arch. Returns `None` for names we don't
-/// know or that don't exist on this arch (those simply aren't filtered).
-#[cfg(target_arch = "x86_64")]
-fn syscall_nr(name: &str) -> Option<u32> {
-    Some(match name {
-        "read" => 0, "write" => 1, "open" => 2, "close" => 3, "stat" => 4,
-        "fstat" => 5, "lstat" => 6, "poll" => 7, "lseek" => 8, "mmap" => 9,
-        "mprotect" => 10, "munmap" => 11, "brk" => 12, "rt_sigaction" => 13,
-        "rt_sigprocmask" => 14, "rt_sigreturn" => 15, "ioctl" => 16,
-        "pread64" => 17, "pwrite64" => 18, "readv" => 19, "writev" => 20,
-        "access" => 21, "pipe" => 22, "select" => 23, "sched_yield" => 24,
-        "mremap" => 25, "msync" => 26, "madvise" => 28, "dup" => 32, "dup2" => 33,
-        "nanosleep" => 35, "getpid" => 39, "sendfile" => 40, "socket" => 41,
-        "connect" => 42, "accept" => 43, "sendto" => 44, "recvfrom" => 45,
-        "sendmsg" => 46, "recvmsg" => 47, "shutdown" => 48, "bind" => 49,
-        "listen" => 50, "getsockname" => 51, "setsockopt" => 54, "getsockopt" => 55,
-        "clone" => 56, "fork" => 57, "vfork" => 58, "execve" => 59, "exit" => 60,
-        "wait4" => 61, "kill" => 62, "uname" => 63, "fcntl" => 72, "fsync" => 74,
-        "getcwd" => 79, "chdir" => 80, "rename" => 82, "mkdir" => 83, "rmdir" => 84,
-        "creat" => 85, "link" => 86, "unlink" => 87, "symlink" => 88,
-        "readlink" => 89, "chmod" => 90, "fchmod" => 91, "chown" => 92,
-        "umask" => 95, "getrlimit" => 97, "getuid" => 102, "getgid" => 104,
-        "setuid" => 105, "setgid" => 106, "geteuid" => 107, "getegid" => 108,
-        "setpgid" => 109, "getppid" => 110, "setsid" => 112, "getgroups" => 115,
-        "setgroups" => 116, "setresuid" => 117, "setresgid" => 119, "ptrace" => 101,
-        "prctl" => 157, "arch_prctl" => 158, "setrlimit" => 160, "chroot" => 161,
-        "mount" => 165, "umount2" => 166, "reboot" => 169, "sethostname" => 170,
-        "init_module" => 175, "delete_module" => 176, "gettid" => 186,
-        "futex" => 202, "sched_getaffinity" => 204, "getdents64" => 217,
-        "set_tid_address" => 218, "clock_gettime" => 228, "clock_nanosleep" => 230,
-        "exit_group" => 231, "epoll_ctl" => 233, "openat" => 257, "mkdirat" => 258,
-        "mknodat" => 259, "fchownat" => 260, "newfstatat" => 262, "unlinkat" => 263,
-        "renameat" => 264, "linkat" => 265, "symlinkat" => 266, "readlinkat" => 267,
-        "fchmodat" => 268, "faccessat" => 269, "pselect6" => 270, "ppoll" => 271,
-        "unshare" => 272, "set_robust_list" => 273, "splice" => 275,
-        "utimensat" => 280, "epoll_pwait" => 281, "eventfd2" => 290,
-        "epoll_create1" => 291, "dup3" => 292, "pipe2" => 293, "prlimit64" => 302,
-        "seccomp" => 317, "getrandom" => 318, "memfd_create" => 319,
-        "execveat" => 322, "statx" => 332, "rseq" => 334, "clone3" => 435,
-        "close_range" => 436, "openat2" => 437, "faccessat2" => 439,
-        "fchmodat2" => 452,
-        _ => return None,
-    })
-}
-
-#[cfg(target_arch = "aarch64")]
-fn syscall_nr(name: &str) -> Option<u32> {
-    Some(match name {
-        "io_setup" => 0, "getcwd" => 17, "eventfd2" => 19, "epoll_create1" => 20,
-        "epoll_ctl" => 21, "epoll_pwait" => 22, "dup" => 23, "dup3" => 24,
-        "fcntl" => 25, "ioctl" => 29, "mknodat" => 33, "mkdirat" => 34,
-        "unlinkat" => 35, "symlinkat" => 36, "linkat" => 37, "renameat" => 38,
-        "umount2" => 39, "mount" => 40, "pivot_root" => 41, "statfs" => 43,
-        "ftruncate" => 46, "faccessat" => 48, "chdir" => 49, "fchmod" => 52,
-        "fchmodat" => 53, "fchownat" => 54, "fchown" => 55, "openat" => 56,
-        "close" => 57, "pipe2" => 59, "getdents64" => 61, "lseek" => 62,
-        "read" => 63, "write" => 64, "readv" => 65, "writev" => 66, "pread64" => 67,
-        "pwrite64" => 68, "ppoll" => 73, "splice" => 76, "readlinkat" => 78,
-        "newfstatat" => 79, "fstat" => 80, "fsync" => 82, "utimensat" => 88,
-        "exit" => 93, "exit_group" => 94, "futex" => 98, "set_robust_list" => 99,
-        "nanosleep" => 101, "clock_gettime" => 113, "clock_nanosleep" => 115,
-        "sched_yield" => 124, "kill" => 129, "rt_sigaction" => 134,
-        "rt_sigprocmask" => 135, "rt_sigreturn" => 139, "setpgid" => 154,
-        "setsid" => 157, "getgroups" => 158, "setgroups" => 159, "uname" => 160,
-        "sethostname" => 161, "getrlimit" => 163, "setrlimit" => 164, "umask" => 166,
-        "prctl" => 167, "getpid" => 172, "getppid" => 173, "getuid" => 174,
-        "geteuid" => 175, "getgid" => 176, "getegid" => 177, "gettid" => 178,
-        "socket" => 198, "bind" => 200, "listen" => 201, "accept" => 202,
-        "connect" => 203, "getsockname" => 204, "sendto" => 206, "recvfrom" => 207,
-        "setsockopt" => 208, "getsockopt" => 209, "brk" => 214, "munmap" => 215,
-        "mremap" => 216, "clone" => 220, "execve" => 221, "mmap" => 222,
-        "mprotect" => 226, "madvise" => 233, "wait4" => 260, "prlimit64" => 261,
-        "renameat2" => 276, "seccomp" => 277, "getrandom" => 278, "memfd_create" => 279,
-        "execveat" => 281, "statx" => 291, "rseq" => 293, "reboot" => 142,
-        "ptrace" => 117, "init_module" => 105, "delete_module" => 106,
-        "unshare" => 97, "setresuid" => 147, "setresgid" => 149, "setuid" => 146,
-        "setgid" => 144, "chroot" => 51, "clone3" => 435, "close_range" => 436,
-        "openat2" => 437, "faccessat2" => 439, "fchmodat2" => 452,
-        _ => return None,
-    })
+/// Installs the program on the calling thread. Without no_new_privs this
+/// needs `CAP_SYS_ADMIN`.
+pub fn install(prog: &Program) -> core::result::Result<(), Errno> {
+    sc::set_mode_filter(prog.flags, prog.insns.as_slice()).map(drop)
 }
