@@ -210,18 +210,19 @@ expect_eq "userns: root inside" \
 
 # ---- seccomp: Docker's default profile ----
 if [ -f /work/default.json ]; then
-	# Resolve Docker's includes/excludes the way dockerd would for these caps.
+	# Resolve Docker's includes/excludes the way dockerd would for these
+	# caps and this architecture (Docker's names: amd64, arm64).
 	cat > "$WORK/resolve.jq" <<'J'
 def caps: ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"];
 .linux.seccomp = ($profile[0] | .syscalls |= map(select(
 	((.includes.caps // []) - caps | length == 0)
-	and ((.includes.arches // ["amd64"]) | index("amd64") != null)
+	and ((.includes.arches // [$arch]) | index($arch) != null)
 	and ((.excludes.caps // []) - ((.excludes.caps // []) - caps) | length == 0)
-	and ((.excludes.arches // []) | index("amd64") == null)
+	and ((.excludes.arches // []) | index($arch) == null)
 ) | del(.includes, .excludes, .comment)))
 J
 	B=$(mkbundle seccomp '.')
-	jq --slurpfile profile /work/default.json -f "$WORK/resolve.jq" "$B/config.json" > "$B/c" && mv "$B/c" "$B/config.json"
+	jq --arg arch "$(dpkg --print-architecture)" --slurpfile profile /work/default.json -f "$WORK/resolve.jq" "$B/config.json" > "$B/c" && mv "$B/c" "$B/config.json"
 	run_sc() { jq '.process.args = $ARGS.positional' "$B/config.json" --args -- "$@" > "$B/c" && mv "$B/c" "$B/config.json"; z run -b "$B" seccomp 2>&1; }
 	expect_has "seccomp: filter on" "$(run_sc grep Seccomp: /proc/self/status)" "$(printf 'Seccomp:\t2')"
 	expect_has "seccomp: ordinary work" "$(run_sc sh -c 'echo hi | cat; ls / >/dev/null && echo fine')" "hi"

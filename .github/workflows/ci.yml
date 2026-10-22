@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# zrc builds against ../xorpio until it depends on the published crate, so
+# each job checks both repositories out side by side.
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: zrc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: zrc
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xorps/xorpio
+          ref: develop
+          path: xorpio
+          persist-credentials: false
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: make check
+
+  # Release builds (which fail to link if a panic path is left), then the
+  # end-to-end and containerd tests as root, on native amd64 and arm64.
+  e2e:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: zrc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: zrc
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xorps/xorpio
+          ref: develop
+          path: xorpio
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: make e2e e2e-containerd ARCH=${{ matrix.arch }}
