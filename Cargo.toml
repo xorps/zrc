@@ -6,6 +6,9 @@ rust-version = "1.99"
 description = "A libc-free, allocation-free OCI container runtime (runc alternative) in Rust"
 license = "Apache-2.0"
 repository = "https://github.com/xorps/zrc"
+# A static binary for *-unknown-none, distributed prebuilt: `cargo install`
+# would ignore .cargo/config.toml and build it wrong.
+publish = false
 
 [[bin]]
 name = "zrc"
