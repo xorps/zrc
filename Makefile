@@ -1,5 +1,11 @@
 TARGETS := x86_64-unknown-none aarch64-unknown-none
-BIN := target/x86_64-unknown-none/release/zrc
+# The architecture the Docker-based targets run on: amd64 or arm64.
+ARCH ?= amd64
+TRIPLE_amd64 := x86_64
+TRIPLE_arm64 := aarch64
+TRIPLE := $(TRIPLE_$(ARCH))
+BIN := target/$(TRIPLE)-unknown-none/release/zrc
+SYSBOX_BIN := target/sysbox/$(TRIPLE)-unknown-none/release/zrc
 # Docker's default seccomp profile, for the end-to-end tests.
 SECCOMP_PROFILE := https://raw.githubusercontent.com/moby/moby/v27.5.1/profiles/seccomp/default.json
 E2E_IMAGE := debian:trixie-slim
@@ -16,21 +22,21 @@ build:
 	$(foreach t,$(TARGETS),cargo build --release --target $(t) &&) \
 	$(foreach t,$(TARGETS),cargo build --release --target $(t) --features sysbox --target-dir target/sysbox &&) true
 
-# Runs tests/e2e.sh as root in a privileged container (amd64).
+# Runs tests/e2e.sh as root in a privileged container.
 e2e: build
-	docker run --rm --privileged --init --platform linux/amd64 -v "$(CURDIR)":/src:ro $(E2E_IMAGE) sh -c \
+	docker run --rm --privileged --init --platform linux/$(ARCH) -v "$(CURDIR)":/src:ro $(E2E_IMAGE) sh -c \
 		'apt-get update -qq && apt-get install -y -qq busybox-static runc jq curl ca-certificates >/dev/null && \
 		mkdir -p /work && curl -fsSL -o /work/default.json $(SECCOMP_PROFILE) && \
-		/src/tests/e2e.sh /src/$(BIN) /src/target/sysbox/x86_64-unknown-none/release/zrc'
+		/src/tests/e2e.sh /src/$(BIN) /src/$(SYSBOX_BIN)'
 
 # Runs containers through containerd's runc shim with zrc as the runtime.
 e2e-containerd: build
-	docker run --rm --privileged --init --platform linux/amd64 -v "$(CURDIR)":/src:ro $(E2E_IMAGE) sh -c \
+	docker run --rm --privileged --init --platform linux/$(ARCH) -v "$(CURDIR)":/src:ro $(E2E_IMAGE) sh -c \
 		'apt-get update -qq && apt-get install -y -qq containerd >/dev/null && /src/tests/containerd.sh /src/$(BIN)'
 
 # Compares zrc with runc and crun.
 bench: build
-	docker run --rm --privileged --init --platform linux/amd64 -v "$(CURDIR)":/src:ro $(E2E_IMAGE) sh -c \
+	docker run --rm --privileged --init --platform linux/$(ARCH) -v "$(CURDIR)":/src:ro $(E2E_IMAGE) sh -c \
 		'apt-get update -qq && apt-get install -y -qq busybox-static runc crun jq time >/dev/null && \
 		runc --version | head -1 && crun --version | head -1 && /src/tests/bench.sh /src/$(BIN)'
 
