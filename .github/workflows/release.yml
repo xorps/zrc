@@ -1,0 +1,91 @@
+name: Release
+
+# release-plz keeps a release PR open with the next version and changelog;
+# merging it tags v<version> and creates a GitHub release, to which the
+# binaries job attaches static builds. See release-plz.toml.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    if: github.repository_owner == 'xorps'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      created: ${{ steps.release-plz.outputs.releases_created }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - id: release-plz
+        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: tag
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: echo "tag=$(echo "$RELEASES" | jq -r '.[0].tag // empty')" >> "$GITHUB_OUTPUT"
+
+  # Builds both architectures from the released tag (a release build also
+  # proves there is no panic path) and attaches them with checksums.
+  binaries:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: make build
+      - name: Collect binaries
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-none/release/zrc dist/zrc-x86_64
+          cp target/aarch64-unknown-none/release/zrc dist/zrc-aarch64
+          cd dist && sha256sum zrc-* > SHA256SUMS
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+
+  release-pr:
+    if: github.repository_owner == 'xorps'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

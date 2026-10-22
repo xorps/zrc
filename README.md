@@ -59,6 +59,18 @@ that it is procfs.
 Linux 5.14 or later (`cgroup.kill`, `mount_setattr`, `clone3` into a
 cgroup), cgroup v2, x86_64 or aarch64. zrc runs as root.
 
+## Install
+
+Each [GitHub release](https://github.com/xorps/zrc/releases) has static
+binaries, `zrc-x86_64` and `zrc-aarch64`, and their `SHA256SUMS`:
+
+```sh
+curl -fLO https://github.com/xorps/zrc/releases/download/v0.0.1/zrc-x86_64
+curl -fLO https://github.com/xorps/zrc/releases/download/v0.0.1/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+install -m 0755 zrc-x86_64 /usr/local/bin/zrc
+```
+
 ## Build and use
 
 ```sh
@@ -77,6 +89,16 @@ zrc [--root dir] create [-b bundle] [--pid-file file] <id>
 zrc [--root dir] start|state|delete [--force]|kill [--all] <id> [signal]
 zrc run [-b bundle] <id>     # create, start, wait, delete; exits with the container's status
 ```
+
+## Releasing
+
+[release-plz](https://release-plz.dev) runs on every push to `main`
+(`.github/workflows/release.yml`). zrc is not on crates.io: release-plz
+reads versions from git tags. It keeps a release PR open with the next
+version (`0.0.1`, `0.0.2`, ...) and `CHANGELOG.md`; merging it runs CI,
+tags `v<version>`, creates a GitHub pre-release, and attaches binaries for
+both architectures built from that tag. Moving past `0.0.x` is deliberate:
+`release-plz set-version zrc@0.1.0`.
 
 ## Sysbox mode
 
