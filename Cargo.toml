@@ -12,7 +12,7 @@ name = "zrc"
 path = "src/main.rs"
 
 [dependencies]
-xorpio = { path = "../xorpio" }
+xorpio = "0.1.0-alpha.1"
 
 [features]
 default = []

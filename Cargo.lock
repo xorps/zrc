@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "xorpio"
 version = "0.1.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85802d4802abc92034677071e3cfc009be4c772a4abf974d618a4f24f090f1ab"
 
 [[package]]
 name = "zrc"
