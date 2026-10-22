@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    # release.yml runs this for main.
+    branches-ignore: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read

@@ -1,0 +1,13 @@
+[workspace]
+# zrc is not on crates.io: versions come from git tags, and releases are
+# tags and GitHub releases with prebuilt binaries (.github/workflows/release.yml).
+git_only = true
+# Release when the release PR is merged, not on every push.
+release_always = false
+# Mark releases as pre-releases while in 0.0.x. release-plz bumps 0.0.x
+# versions by one patch each time; moving to 0.1.0 is a manual
+# `release-plz set-version`. (It does not recognise -alpha.N tags in
+# git-only mode, so zrc uses 0.0.x instead.)
+git_release_type = "pre"
+# A binary has no Rust API to check.
+semver_check = false
