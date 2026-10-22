@@ -4,6 +4,8 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A libc-free, allocation-free OCI container runtime (runc alternative) in Rust"
+license = "Apache-2.0"
+repository = "https://github.com/xorps/zrc"
 
 [[bin]]
 name = "zrc"

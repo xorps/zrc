@@ -97,3 +97,9 @@ Terminals (`process.terminal`, `--console-socket`), hooks, seccomp notify
 new time namespaces, shared mount propagation, id-mapped mounts, `blockIO`/`network`/`rdma` limits,
 `linux.mountLabel`, `exec`, `ps`, `update`, `pause`. Seccomp filters allow
 only the native architecture (32-bit x86 binaries are killed).
+
+## License
+
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or
+<https://www.apache.org/licenses/LICENSE-2.0>).
+
